@@ -90,9 +90,7 @@ class Result(object):
                 x, y, z, xx, yy, zz = _read_binary_grid(f)
         except FileNotFoundError:
             print('Unable to locate grid for ' + self._xml_file)
-            xx = None
-            yy = None
-            zz = None
+            return None, None, None
 
         # Unit conversions here should probably have been done in step3_piv.cpp
         # The spatial grid is output in pixels - convert to meters
