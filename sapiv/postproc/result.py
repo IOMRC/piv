@@ -85,8 +85,14 @@ class Result(object):
 
     def _loadgrid(self):
 
-        with open(self._result_root + "xyz_grid_" + self.piv_tag + "_pass%i.bin" % self.grid, "rb") as f:
-            x, y, z, xx, yy, zz = _read_binary_grid(f)
+        try:
+            with open(self._result_root + "xyz_grid_" + self.piv_tag + "_pass%i.bin" % self.grid, "rb") as f:
+                x, y, z, xx, yy, zz = _read_binary_grid(f)
+        except FileNotFoundError:
+            print('Unable to locate grid for ' + self._xml_file)
+            xx = None
+            yy = None
+            zz = None
 
         # Unit conversions here should probably have been done in step3_piv.cpp
         # The spatial grid is output in pixels - convert to meters
@@ -241,6 +247,8 @@ class Result(object):
                 else: 
                     print('Processing binary data...')
                     xx, yy, zz = self._loadgrid()
+                    if xx is None:
+                        return None
                     
                     dx = float(xx[1] - xx[0])
                     dy = float(yy[1] - yy[0])
