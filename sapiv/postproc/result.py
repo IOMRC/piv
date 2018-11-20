@@ -2,12 +2,14 @@ import xarray as xr
 import numpy as np
 import pandas as pd
 import scipy.ndimage as nd
+import scipy.interpolate as si
 import dask.array as da
 from dask import delayed
 import os
 import shutil
 import struct
 import copy
+import matplotlib.pyplot as pl
 
 from xml.etree import ElementTree
 from collections import OrderedDict
@@ -37,11 +39,12 @@ def _read_binary_grid(f):
 
 class Result(object):
 
-    def __init__(self, xml_file='', reprocess=False, result_root=None, data_root=None, piv_pass=-1, from_nc=False):
+    def __init__(self, xml_file='', reprocess=False, result_root=None, data_root=None, piv_pass=-1, from_nc=False, norm_dims=False):
         self._xml_file = xml_file
         self._ds = None
         self._reprocess = reprocess
         self._from_nc = from_nc
+        self._norm_dims = norm_dims
 
         self._xml_data = ElementTree.parse(xml_file)
         self._xml_root = self._xml_data.getroot()
@@ -221,76 +224,243 @@ class Result(object):
 
             if reprocess:
                 if file_exists:
-                    print('Removing old file ' + self._result_file)
-                    shutil.rmtree(self._result_file)
+                    print('Old file exists ' + self._result_file)
+                    #print('Removing old file ' + self._result_file)
+                    #shutil.rmtree(self._result_file)
 
                 ds_data = OrderedDict()
 
-                if self._from_nc:
-                    print('Processing existing netcdf')
+                to_seconds = np.vectorize(lambda x: x.seconds + x.microseconds / 1E6)
 
-                    ds_temp = xr.open_dataset(self._result_file[:-4] + 'nc',chunks={'time':50})
-                    u = ds_temp['U']
-                    u.attrs = {'standard_name': 'sea_water_x_velocity', 'units': 'm s-1'}
-                    v = ds_temp['V']
-                    v.attrs = {'standard_name': 'sea_water_x_velocity', 'units': 'm s-1'}
-                    w = ds_temp['W']
-                    w.attrs = {'standard_name': 'upward_sea_water_velocity', 'units': 'm s-1'}
-                    tt = ds_temp['time']
-                    te = to_seconds(tt - tt[0])
-
-                    add_vars=['xn','yn','zn','ws','mean_image','velocity_weight']                    
-                    for v in add_vars:
-                        ds_data[v]=ds_temp[v]
-                else: 
-                    print('Processing binary data...')
-                    xx, yy, zz = self._loadgrid()
-                    if xx is None:
-                        return None
-                    
-                    dx = float(xx[1] - xx[0])
-                    dy = float(yy[1] - yy[0])
-                    dz = float(zz[1] - zz[0])
-
-                    #tt, uu, vv, ww = self._loaddata(xx, yy, zz)
+                print('Processing binary data...')
+                xx, yy, zz = self._loadgrid()
+                if xx is None:
+                    if self._from_nc:
+                        print('Processing existing netcdf...')
+                        fn = self._result_file[:-5] + '_QC_raw.nc'
+                        if os.path.exists(fn):
+                            ds_temp = xr.open_dataset(self._result_file[:-5] + '_QC_raw.nc',chunks={'time':50})
+                            u = da.transpose(ds_temp['U'].data,axes=[3,0,1,2])
+                            v = da.transpose(ds_temp['V'].data,axes=[3,0,1,2])
+                            w = da.transpose(ds_temp['W'].data,axes=[3,0,1,2])
+                            tt = ds_temp['time']
+                            te = (tt - tt[0]) / np.timedelta64(1, 's')
+                            xx = ds_temp['x'].values
+                            yy = ds_temp['y'].values
+                            zz = ds_temp['z'].values
+                        else:
+                            print('USING OLD ZARR DATA')
+                            ds_temp = xr.open_zarr(self._result_file)
+                            u = da.transpose(ds_temp['U'].data,axes=[3,0,1,2])
+                            v = da.transpose(ds_temp['V'].data,axes=[3,0,1,2])
+                            w = da.transpose(ds_temp['W'].data,axes=[3,0,1,2])
+                            tt = ds_temp['time']
+                            te = (tt - tt[0]) / np.timedelta64(1, 's')
+                            xx = ds_temp['x'].values
+                            yy = ds_temp['y'].values
+                            zz = ds_temp['z'].values
+                            print('ERROR: No NetCDF data found for ' + self._xml_file)
+                            #return None
+                            # print(u.shape)
+                 
+                else:
                     tt, uvw = self._loaddata(xx, yy, zz)
                     if tt is None:
-                        print('No binary data found for ' + self._xml_file)
+                        print('ERROR: No binary data found for ' + self._xml_file)
                         return None
 
                     # calculate the elapsed time from the Timestamp objects and then convert to datetime64 datatype
-                    to_seconds = np.vectorize(lambda x: x.seconds + x.microseconds / 1E6)
                     te = to_seconds(tt - tt[0])
                     tt = pd.to_datetime(tt)
+                    uvw = uvw.persist()
+                    u = uvw[:,:,:,:,0]
+                    v = uvw[:,:,:,:,1]
+                    w = uvw[:,:,:,:,2]
 
-#                    u = xr.DataArray(uu, coords=[xx, yy, zz, tt], dims=['x', 'y', 'z', 'time'],
+#                    u = xr.DataArray(uvw[:,:,:,:,0], coords=[tt, xx, yy, zz], dims=['time','x', 'y', 'z'],
 #                                     name='U', attrs={'standard_name': 'sea_water_x_velocity', 'units': 'm s-1'})
-#                    v = xr.DataArray(vv, coords=[xx, yy, zz, tt], dims=['x', 'y', 'z', 'time'],
+#                    v = xr.DataArray(uvw[:,:,:,:,1], coords=[tt, xx, yy, zz], dims=['time', 'x', 'y', 'z'],
 #                                     name='V', attrs={'standard_name': 'sea_water_x_velocity', 'units': 'm s-1'})
-#                    w = xr.DataArray(ww, coords=[xx, yy, zz, tt], dims=['x', 'y', 'z', 'time'],
+#                    w = xr.DataArray(uvw[:,:,:,:,2], coords=[tt, xx, yy, zz], dims=['time', 'x', 'y', 'z'],
 #                                     name='W', attrs={'standard_name': 'upward_sea_water_velocity', 'units': 'm s-1'})
 
+                if xx is None:
+                    print('No data found')
+                    return None
 
-                    u = xr.DataArray(uvw[:,:,:,:,0], coords=[tt, xx, yy, zz], dims=['time','x', 'y', 'z'],
-                                     name='U', attrs={'standard_name': 'sea_water_x_velocity', 'units': 'm s-1'})
-                    v = xr.DataArray(uvw[:,:,:,:,1], coords=[tt, xx, yy, zz], dims=['time', 'x', 'y', 'z'],
-                                     name='V', attrs={'standard_name': 'sea_water_x_velocity', 'units': 'm s-1'})
-                    w = xr.DataArray(uvw[:,:,:,:,2], coords=[tt, xx, yy, zz], dims=['time', 'x', 'y', 'z'],
-                                     name='W', attrs={'standard_name': 'upward_sea_water_velocity', 'units': 'm s-1'})
+                u = u.persist()
+                v = v.persist()
+                w = w.persist()
+
+                dx = float(xx[1] - xx[0])
+                dy = float(yy[1] - yy[0])
+                dz = float(zz[1] - zz[0])
+
+                
+                if self._norm_dims:
+                    exp = self._result_root.split('/')[4]
+                    runSheet = pd.read_csv('~/RunSheet-%s.csv' % exp)
+                    runSheet = runSheet.set_index('RunID')
+                    runDetails = runSheet.ix[int(self.run_id[-2:])]
+
+                    T = runDetails['T (s)']
+                    h = runDetails['h (m)']
+                    D = runDetails['D (m)']
+            
+                    ww = te / T
+                    om = 2. * np.pi / T
+                    d_s = (2. * 1E-6 / om) ** 0.5
+                    bl = 3. * np.pi / 4. * d_s
+                    
+                    if exp == 'Exp6':
+                        if D == 0.1:
+                            dy_c = (188. + 82.)/2
+                            dx_c = 39.25
+                            cx = dx_c / 1000.
+                            cy = dy_c / 1000.
+                        else:
+                            dy_c = (806. + 287.) / 2. * 0.22
+                            dx_c = 113 * 0.22
+                            cx = dx_c / 1000.
+                            cy = dy_c / 1000.   
+                    elif exp == 'Exp8':
+                        dy_c = 624 * 0.22
+                        dx_c = 15
+                        cx = dx_c / 1000.
+                        cy = dy_c / 1000.
+                    xn = (xx + (D / 2. - cx)) / D
+                    yn = (yy - cy) / D
+                    zn = zz / h
+ 
+                    xnm, ynm = np.meshgrid(xn, yn)
+                    rr = np.sqrt(xnm ** 2. + ynm ** 2)
+                    cylMask = rr < 0.5
+
+                    nanPlane = np.ones(cylMask.shape)
+                    nanPlane[cylMask] = np.nan
+                    nanPlane = nanPlane.T
+                    nanPlane = nanPlane[np.newaxis,:, :, np.newaxis]
+
+                    u = u * nanPlane
+                    v = v * nanPlane
+                    w = w * nanPlane
+
+                    if D == 0.1:
+                        xInds = xn > 3.
+                    else:
+                        xInds = xn > 2.
+
+                    blInd = np.argmax(zn > bl / h)
+                    blPlane = int(round(blInd))
+
+                    Ue = u[:,xInds,:,:]
+                    Ue_bar = da.nanmean(Ue,axis=(1,2,3)).compute()
+                    Ue_bl = da.nanmean(Ue[:,:,:,blPlane],axis=(1,2)).compute()
+
+                    inds = ~np.isnan(Ue_bl)
+
+                    xv = ww[inds] % 1.
+                    xv = xv + np.random.normal(scale=1E-6,size=xv.shape)
+                    yv = Ue_bl[inds]
+                    xy = np.stack([np.concatenate([xv-1.,xv,xv+1.]),np.concatenate([yv,yv,yv])]).T
+                    xy = xy[xy[:,0].argsort(),:]
+                    xi = np.linspace(-0.5,1.5,len(xv)/8)
+                    n = np.nanmax(xy[:,1])
+                    # print(n)
+                    # fig,ax = pl.subplots()
+                    # ax.scatter(xy[:,0],xy[:,1]/n)
+                    # print(xy)
+                    spl = si.LSQUnivariateSpline(xy[:,0],xy[:,1]/n,t=xi,k=3)
+                    roots = spl.roots()
+                    der = spl.derivative()
+                    slope=der(roots)
+                    inds = np.min(np.where(slope>0))
+                    dt=(roots[inds]%1.).mean()-0.5
+
+                    tpx=np.arange(0,0.5,0.001)
+                    U0_bl=np.abs(spl(tpx+dt).min()*n)
+                    ws = ww - dt
+                    Ue_spl = spl((ws-0.5)%1.0+dt)*n*-1.0
+
+                    #maxima = spl.derivative().roots()
+                    #Umax = spl(maxima)
+                    #UminIdx = np.argmin(Umax)
+                    #U0_bl = np.abs(Umax[UminIdx]*n)
+
+                    #ww_at_min = maxima[UminIdx]
+                    #ws = ww - ww_at_min + 0.25
+
+                    inds = ~np.isnan(Ue_bar)
+
+                    xv = ww[inds] % 1.
+                    xv = xv + np.random.normal(scale=1E-6,size=xv.shape)
+                    yv = Ue_bar[inds]
+                    xy = np.stack([np.concatenate([xv-1.,xv,xv+1.]),np.concatenate([yv,yv,yv])]).T
+                    xy = xy[xy[:,0].argsort(),:]
+                    xi = np.linspace(-0.5,1.5,len(xv)/8)
+                    n = np.nanmax(xy[:,1])
+                    spl = si.LSQUnivariateSpline(xy[:,0],xy[:,1]/n,t=xi,k=4)
+                    maxima = spl.derivative().roots()
+                    Umax = spl(maxima)
+                    UminIdx = np.argmin(Umax)
+                    U0_bar = np.abs(Umax[UminIdx]*n)
+
+                    ww = xr.DataArray(ww, coords=[tt, ], dims=['time', ])
+                    ws = xr.DataArray(ws-0.5, coords=[tt, ], dims=['time', ])
+
+                    xn = xr.DataArray(xn, coords=[xx, ], dims=['x', ])
+                    yn = xr.DataArray(yn, coords=[yy, ], dims=['y', ])
+                    zn = xr.DataArray(zn, coords=[zz, ], dims=['z', ])
+                    
+                    Ue_bar = xr.DataArray(Ue_bar, coords=[tt, ], dims=['time', ])
+                    Ue_bl = xr.DataArray(Ue_bl, coords=[tt, ], dims=['time', ])
+                    Ue_spl = xr.DataArray(Ue_spl, coords=[tt, ], dims=['time', ])
+
+                    ds_data['ww'] = ww
+                    ds_data['ws'] = ws
+
+                    ds_data['xn'] = xn
+                    ds_data['yn'] = yn
+                    ds_data['zn'] = zn
+
+                    ds_data['Ue_bar'] = Ue_bar
+                    ds_data['Ue_bl'] = Ue_bl
+                    ds_data['Ue_spl'] = Ue_spl
+
 
                 te = xr.DataArray(te, coords=[tt, ], dims=['time', ])
 
-                ds_data['U'] = u
-                ds_data['V'] = v
-                ds_data['W'] = w
+                dims = ['time','x', 'y', 'z']
+                coords = [tt, xx, yy, zz]
+
+                ds_data['U'] = xr.DataArray(u, coords=coords, dims=dims,
+                                     name='U', attrs={'standard_name': 'sea_water_x_velocity', 'units': 'm s-1'})
+                ds_data['V'] = xr.DataArray(v, coords=coords, dims=dims,
+                                     name='V', attrs={'standard_name': 'sea_water_x_velocity', 'units': 'm s-1'})
+                ds_data['W'] = xr.DataArray(w, coords=coords, dims=dims,
+                                     name='W', attrs={'standard_name': 'sea_water_x_velocity', 'units': 'm s-1'})
                 ds_data['te'] = te
 
+
+                # stdV = da.nanstd(v)
+                # stdW = da.nanstd(w)
+                # thres=7.
+                if 'U0_bl' in locals():
+                    condition = (da.fabs(v)/U0_bl>1.5) | (da.fabs(w)/U0_bl>0.6)
+                    for var in ['U','V','W']:
+                        ds_data[var].data=da.where(condition,np.nan,ds_data[var].data)
+            
                 piv_step_frame = float(self._xml_root.findall('piv/stepFrame')[0].text)
 
                 print('Calculating tensor')
                 # j = jacobianConv(ds.U, ds.V, ds.W, dx, dy, dz, sigma=1.5)
-                j = jacobianDask(uvw[:,:,:,:,0],uvw[:,:,:,:,1], uvw[:,:,:,:,2], piv_step_frame, dx, dy, dz)
+                j = jacobianDask(u,v,w, piv_step_frame, dx, dy, dz)
+                print('Done') 
+                #j = da.from_array(j,chunks=(20,-1,-1,-1,-1,-1))
+
+#                j = jacobianDask(uvw[:,:,:,:,0],uvw[:,:,:,:,1], uvw[:,:,:,:,2], piv_step_frame, dx, dy, dz)
                 jT = da.transpose(j,axes=[0,1,2,3,5,4])
+
 
 #                j = j.persist()
 #                jT = jT.persist()
@@ -303,7 +473,7 @@ class Result(object):
                 strainTensorNorm = da.sqrt(da.nansum(da.nansum(strainTensor ** 2.,axis=-1),axis=-1))
                 vorticityTensorNorm = da.sqrt(da.nansum(da.nansum(vorticityTensor ** 2.,axis=-1),axis=-1))
                 divergence = j[:,:,:,:,0,0] + j[:,:,:,:,1,1] + j[:,:,:,:,2,2] 
-    
+                # print(divergence) 
                 omx = vorticityTensor[:, :, :, :, 2, 1] * 2.
                 omy = vorticityTensor[:, :, :, :, 0, 2] * 2.
                 omz = vorticityTensor[:, :, :, :, 1, 0] * 2.
@@ -351,7 +521,6 @@ class Result(object):
                                                        coords=[tt, xx, yy, zz],
                                                        dims=['time','x', 'y', 'z'],
                                                        name='divergence')
-    
 
                 ds_data['omx'] = xr.DataArray(omx,
                                               coords=[tt, xx, yy, zz],
@@ -377,14 +546,33 @@ class Result(object):
 #                ds_data['divNorm_std'] = xr.DataArray(divNorm_std)
 
                 ds = xr.Dataset(ds_data)
-                if self._from_nc:
-                    for k,v in ds_temp.attrs.items():
-                        ds.attrs[k]=v
+#                if self._from_nc:
+#                    for k,v in ds_temp.attrs.items():
+#                        ds.attrs[k]=v
                 #ds = ds.chunk({'time': 20})
 
                 self._append_CF_attrs(ds)
                 self._append_attrs(ds)
                 ds.attrs['filename'] = self._result_file
+
+                if self._norm_dims:
+
+                    KC = U0_bl*T/D
+                    delta = (2.*np.pi*d_s)/h
+                    S = delta/KC
+
+                    ds.attrs['T'] = T
+                    ds.attrs['h'] = h
+                    ds.attrs['D'] = D
+                    ds.attrs['U0_bl'] = U0_bl
+                    ds.attrs['U0_bar'] = U0_bar
+                    ds.attrs['KC'] = KC
+                    ds.attrs['S'] = S
+                    ds.attrs['Delta+'] = ((1E-6*T)**0.5)/h
+                    ds.attrs['Delta_l'] = 2*np.pi*d_s
+                    ds.attrs['Delta_s'] = d_s
+                    ds.attrs['Re_D'] = U0_bl*D/1E-6
+                    ds.attrs['Beta'] = D**2./(1E-6*T)
 
                 delta = (ds.attrs['dx'] * ds.attrs['dy'] * ds.attrs['dz']) ** (1./3.)
                 dpx = (ds.attrs['pdx'] * ds.attrs['pdy'] * ds.attrs['pdz']) ** (1./3.)
@@ -403,7 +591,7 @@ class Result(object):
 #                divNorm_mean = da.nanmean(divNorm)
 #                divNorm_std = da.nanstd(divNorm)
 
-                print("initial save")
+                # print("initial save")
                 #ds.to_zarr(self._result_file,compute=False)
                 #ds = xr.open_zarr(self._result_file)
 
@@ -426,9 +614,28 @@ class Result(object):
                 #ds.attrs['divNorm_std'] = divNorm_std
                 ds.attrs['velocityError'] = velocityError
                 ds.attrs['vorticityError'] = vorticityError
-                print("second save")
+
+                if self._norm_dims:
+                    xInds = (xn>0.5) & (xn<2.65)
+                    yInds = (yn > -0.75) & (yn < 0.75)
+                else:
+                    xInds = range(len(ds['x']))
+                    yInds = range(len(ds['y']))
+                vrms = (ds['V'][:,xInds,yInds,:] ** 2.).mean(dim=['time','x', 'y', 'z']) ** 0.5
+                wrms = (ds['W'][:,xInds,yInds,:] ** 2.).mean(dim=['time','x', 'y', 'z']) ** 0.5
+                ds.attrs['Vrms'] = float(vrms.compute())
+                ds.attrs['Wrms'] = float(wrms.compute())
+
+                #fig,ax = pl.subplots()
+                #ax.plot(ds.ws,ds.Ue_spl/U0_bl,color='k')
+                #ax.plot(ds.ws,ds.Ue_bl/U0_bl,color='g')
+                #ax.set_xlabel(r'$t/T$')
+                #ax.set_ylabel(r'$U_{bl}/U_0$')
+                #fig.savefig(self._result_file[:-4] + 'png',dpi=125)
+                #pl.close(fig)
+                # print("second save")
                 #ds.to_netcdf(self._result_file)
-                ds.to_zarr(self._result_file)
+                ds.to_zarr(self._result_file,mode='w')
                 
                 print('Cached ' + self._result_file)
 
@@ -491,9 +698,9 @@ class DerivedDataset(object):
 
 def jacobianDask(u, v, w, dt, dx, dy, dz):
 
-    du = da.gradient(u, dt, dx, dy, dz, axis=(1, 2, 3))
-    dv = da.gradient(v, dt, dx, dy, dz, axis=(1, 2, 3))
-    dw = da.gradient(w, dt, dx, dy, dz, axis=(1, 2, 3))
+    du = da.gradient(u, dx, dy, dz, dt, axis=(1, 2, 3))
+    dv = da.gradient(v, dx, dy, dz, dt, axis=(1, 2, 3))
+    dw = da.gradient(w, dx, dy, dz, dt, axis=(1, 2, 3))
 
     J = da.stack((da.stack(du, axis=-1), da.stack(dv, axis=-1), da.stack(dw, axis=-1)), axis=-2)
 
